@@ -5,12 +5,13 @@ import pdfplumber
 from pypdf import PdfReader, PdfWriter
 import pytesseract
 import streamlit as st
+from PIL import Image, ImageEnhance, ImageFilter
 
 st.set_page_config(page_title="Separador por Colaborador", layout="wide")
 st.title("Separador Automático de Documentos por Colaborador")
 st.write(
-    "Envie o PDF consolidado. O sistema extrairá o nome de cada página e gerará "
-    "um PDF individual para cada colaborador (1 página = 1 arquivo)."
+    "Envie o PDF consolidado. O sistema extrairá o nome de cada página, "
+    "girará para o sentido correto e gerará um PDF individual para cada colaborador."
 )
 
 # Estado da sessão
@@ -20,63 +21,172 @@ if "relatorio" not in st.session_state:
     st.session_state.relatorio = []
 
 
-def extrair_texto(page_plumber):
-    """Tenta extrair texto nativo; se falhar ou for muito curto, usa OCR."""
-    texto = page_plumber.extract_text() or ""
-    texto_limpo = texto.strip().replace("\n", "").replace(" ", "")
+def preprocessar_para_handwriting(img):
+    """
+    Pré-processa a imagem para melhorar OCR de texto manuscrito (caneta).
+    """
+    # Converter para escala de cinza
+    img = img.convert("L")
 
-    # Fallback OCR apenas se a página parecer escaneada/imagem
-    if len(texto.strip()) < 30 or len(texto_limpo) < 10:
-        try:
-            img = page_plumber.to_image(resolution=300).original
-            try:
-                texto_ocr = pytesseract.image_to_string(img, lang="por")
-            except Exception:
-                texto_ocr = pytesseract.image_to_string(img, lang="eng")
-            if len(texto_ocr.strip()) > len(texto.strip()):
-                texto = texto_ocr
-        except Exception:
-            pass
-    return texto
+    # Aumentar contraste para destacar a caneta azul/preta
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(2.5)
+
+    # Aumentar nitidez
+    enhancer = ImageEnhance.Sharpness(img)
+    img = enhancer.enhance(2.0)
+
+    # Binarização: transforma em preto e branco puro
+    # Isso ajuda muito o Tesseract a ler handwriting
+    img = img.point(lambda x: 0 if x < 150 else 255, "1")
+    
+    return img.convert("L")
 
 
-def extrair_nome(texto):
-    """Extrai o nome baseado no padrão exato do Termo de Ciência."""
+def extrair_texto_completo(page_plumber):
+    """
+    Extrai texto da página inteira com OCR otimizado para handwriting.
+    """
+    try:
+        img = page_plumber.to_image(resolution=300).original
+        
+        # Se estiver em paisagem, rotaciona para retrato para OCR
+        w, h = img.size
+        if w > h:
+            img = img.rotate(-90, expand=True)
+        
+        img_proc = preprocessar_para_handwriting(img)
+        
+        # Configuração do Tesseract:
+        # --psm 6 = Assume um bloco de texto único (melhor para formulários)
+        # --oem 3 = Modo de engine padrão (LSTM + legacy)
+        config = r"--oem 3 --psm 6"
+        
+        texto = pytesseract.image_to_string(img_proc, lang="por", config=config)
+        return texto
+    except Exception:
+        return ""
+
+
+def extrair_roi_nome(page_plumber):
+    """
+    Extrai texto apenas da região onde o nome costuma estar (após 'Eu').
+    Foca no topo-esquerdo do documento onde o campo está localizado.
+    """
+    try:
+        img = page_plumber.to_image(resolution=300).original
+        
+        # Se estiver em paisagem, rotaciona para retrato
+        w, h = img.size
+        if w > h:
+            img = img.rotate(-90, expand=True)
+            w, h = img.size
+        
+        # Crop na região do "Eu, [NOME]" — aproximadamente topo 15%-40%, esquerda 10%-90%
+        # Ajuste esses valores se o layout mudar muito
+        left = int(w * 0.05)
+        top = int(h * 0.10)
+        right = int(w * 0.90)
+        bottom = int(h * 0.45)
+        
+        roi = img.crop((left, top, right, bottom))
+        roi_proc = preprocessar_para_handwriting(roi)
+        
+        config = r"--oem 3 --psm 6"
+        texto = pytesseract.image_to_string(roi_proc, lang="por", config=config)
+        return texto
+    except Exception:
+        return ""
+
+
+def limpar_texto_ocr(texto):
+    """Normaliza o texto do OCR removendo ruídos comuns em handwriting."""
     if not texto:
-        return None
-
-    # Normaliza espaços e quebras de linha em um único espaço
+        return ""
+    # Remove múltiplos espaços
     texto = re.sub(r"\s+", " ", texto)
+    # Corrige caracteres comuns que o OCR confunde
+    texto = texto.replace("|", "I").replace("0", "O")  # em nomes, 0 raramente aparece
+    return texto.strip()
 
-    # PADRÃO 1 (principal): "Eu, NOME COMPLETO colaborador da empresa"
-    # O nome está sempre em maiúsculas antes da palavra "colaborador"
-    padrao = r"Eu,\s+([A-Z][A-Z\s]+?)\s+colaborador\b"
-    match = re.search(padrao, texto, re.IGNORECASE)
-    if match:
-        nome = match.group(1).strip()
-        if 3 < len(nome) < 60:
-            return nome
 
-    # PADRÃO 2 (fallback): campo "Nome:" no rodapé do documento
-    padrao2 = r"Nome:\s*([A-Z][A-Z\s]+?)(?:\s+RG:|\s+MAT:|$)"
-    match = re.search(padrao2, texto)
-    if match:
-        nome = match.group(1).strip()
-        if 3 < len(nome) < 60:
-            return nome
-
-    # PADRÃO 3 (último recurso): qualquer coisa após "Eu," em maiúsculas
-    padrao3 = r"Eu,\s+([A-Z][A-Z\s]+)"
-    match = re.search(padrao3, texto)
-    if match:
-        nome = match.group(1).strip()
-        # Corta se encontrar palavras que não fazem parte do nome
-        for stop in ["COLABORADOR", "DECLARO", "TERMO", "EMPRESA", "INSTRUÇÕES"]:
-            nome = nome.split(stop)[0].strip()
-        if 3 < len(nome) < 60:
-            return nome
-
+def extrair_nome(texto_completo, texto_roi):
+    """
+    Extrai o nome usando múltiplas estratégias.
+    Prioriza o ROI (região do nome), mas usa o texto completo como fallback.
+    """
+    # Tenta primeiro no ROI (mais preciso)
+    for texto in [texto_roi, texto_completo]:
+        if not texto:
+            continue
+            
+        texto = limpar_texto_ocr(texto)
+        texto_upper = texto.upper()
+        
+        # PADRÃO 1: "Eu, NOME COMPLETO, ocupante" ou "Eu NOME COMPLETO ocupante"
+        # Regex flexível para handwriting: aceita letras maiúsculas/minúsculas e espaços
+        padrao = r"Eu[,\s]+([A-Za-zÁÉÍÓÚÀÈÌÒÙÂÊÎÔÛÃÕÇáéíóúàèìòùâêîôûãõç\s]+?)[,\s]+(?:ocupante|de|cargo|declaro)"
+        match = re.search(padrao, texto, re.IGNORECASE)
+        if match:
+            nome = match.group(1).strip()
+            # Remove quebras e normaliza espaços
+            nome = re.sub(r"\s+", " ", nome)
+            # Remove palavras que não fazem parte do nome
+            stopwords = ["OCUPANTE", "DO", "CARGO", "DECLARO", "ESTOU", "CIENTE", 
+                        "TERMO", "COMPROMISSO", "POLITICA", "PROTECAO"]
+            for sw in stopwords:
+                nome = nome.split(sw)[0].strip()
+            if len(nome) > 3:
+                return nome
+        
+        # PADRÃO 2: "Nome: [NOME]" ou "Assinatura: [NOME]" (fallback)
+        padrao2 = r"(?:Nome|Assinatura)[\s:]+([A-Za-zÁÉÍÓÚÀÈÌÒÙÂÊÎÔÛÃÕÇáéíóúàèìòùâêîôûãõç\s]+?)(?:\n|$|,|Data)"
+        match = re.search(padrao2, texto, re.IGNORECASE)
+        if match:
+            nome = match.group(1).strip()
+            nome = re.sub(r"\s+", " ", nome)
+            if len(nome) > 3:
+                return nome
+        
+        # PADRÃO 3: Qualquer coisa após "Eu," até a vírgula ou quebra
+        padrao3 = r"Eu[,\s]+([A-Z][a-zA-ZÁÉÍÓÚÀÈÌÒÙÂÊÎÔÛÃÕÇáéíóúàèìòùâêîôûãõç\s]+)"
+        match = re.search(padrao3, texto)
+        if match:
+            nome = match.group(1).strip()
+            for sw in ["OCUPANTE", "DECLARO", "TERMO", "DE", "CARGO"]:
+                nome = nome.split(sw)[0].strip()
+            if len(nome) > 3:
+                return nome
+    
     return None
+
+
+def extrair_primeiro_nome(nome_completo):
+    """
+    Se o nome completo for muito confuso, tenta retornar pelo menos o primeiro nome.
+    """
+    if not nome_completo:
+        return None
+    partes = nome_completo.split()
+    if partes:
+        return partes[0]
+    return None
+
+
+def rotacionar_pagina_retrato(page_obj):
+    """
+    Adiciona rotação de 90° no PDF para deixar em retrato.
+    Retorna o page_obj modificado.
+    """
+    # /Rotate é a propriedade do PDF que define a rotação em graus
+    # Se a página já tiver rotação, somamos
+    rot_atual = page_obj.get("/Rotate", 0)
+    page_obj[NameObject("/Rotate")] = NumberObject(rot_atual + 90)
+    return page_obj
+
+
+# Import necessário para manipulação de objetos PDF
+from pypdf.generic import NameObject, NumberObject
 
 
 arquivo = st.file_uploader("Selecione o PDF consolidado", type=["pdf"])
@@ -97,29 +207,51 @@ if arquivo is not None:
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
 
                 for idx in range(total):
-                    page = pdf_plumber.pages[idx]
-                    texto = extrair_texto(page)
-                    nome = extrair_nome(texto)
+                    page_plumber = pdf_plumber.pages[idx]
+                    
+                    # Extrai textos
+                    texto_completo = extrair_texto_completo(page_plumber)
+                    texto_roi = extrair_roi_nome(page_plumber)
+                    
+                    # Tenta extrair nome
+                    nome = extrair_nome(texto_completo, texto_roi)
+                    
+                    # Fallback: se não achou nada, tenta usar o primeiro nome do ROI
+                    if not nome and texto_roi:
+                        nome = extrair_primeiro_nome(texto_roi.strip())
+                    
+                    # Limpa o nome para usar como nome de arquivo
+                    if nome:
+                        # Remove caracteres estranhos mas mantém acentos
+                        nome_base = re.sub(r'[\\/*?:"<>|0-9]', "", nome)
+                        nome_base = nome_base.strip()
+                    else:
+                        nome_base = f"NAO_IDENTIFICADO_PAGINA_{idx + 1}"
 
                     status.text(
                         f"Processando página {idx + 1}/{total} — "
-                        f"Nome: {nome or 'NÃO ENCONTRADO'}"
+                        f"Nome: {nome_base or 'NÃO ENCONTRADO'}"
                     )
+
+                    # Pega a página do pypdf e rotaciona se necessário
+                    page_pdf = reader.pages[idx]
+                    
+                    # Verifica se precisa rotacionar (se largura > altura)
+                    # Usamos a caixa de mídia (media box) para verificar dimensões
+                    mb = page_pdf.mediabox
+                    largura = float(mb.width)
+                    altura = float(mb.height)
+                    
+                    if largura > altura:
+                        # Está em paisagem, rotaciona 90° para virar retrato
+                        rot_atual = page_pdf.get("/Rotate", 0)
+                        page_pdf[NameObject("/Rotate")] = NumberObject(rot_atual + 90)
 
                     # Cria PDF com APENAS esta página
                     writer = PdfWriter()
-                    writer.add_page(reader.pages[idx])
+                    writer.add_page(page_pdf)
                     pdf_out = io.BytesIO()
                     writer.write(pdf_out)
-
-                    # Define nome do arquivo
-                    if nome:
-                        nome_base = nome
-                    else:
-                        nome_base = f"NOME_NAO_ENCONTRADO_PAGINA_{idx + 1}"
-
-                    # Remove caracteres inválidos para nome de arquivo
-                    nome_base = re.sub(r'[\\/*?:"<>|]', "", nome_base)
 
                     # Evita sobrescrever caso existam nomes idênticos
                     if nome_base in contadores:
@@ -134,6 +266,7 @@ if arquivo is not None:
                         "Arquivo": nome_arquivo,
                         "Página Original": idx + 1,
                         "Nome Extraído": nome or "—",
+                        "Texto ROI": (texto_roi[:100].replace("\n", " ") + "...") if texto_roi else "—",
                     })
 
                     barra.progress((idx + 1) / total)
