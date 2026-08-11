@@ -1,104 +1,213 @@
 import io
 import re
 import zipfile
-import PyPDF2
+import pdfplumber
+from pypdf import PdfReader, PdfWriter
+import pytesseract
 import streamlit as st
 
-# Configuração da página
-st.set_page_config(page_title="Renomeador de Documentos", layout="centered")
-
-st.title("Renomeador Automático de Termos de Ciência")
+st.set_page_config(page_title="Separador Automático por Nome", layout="wide")
+st.title("Separador Automático de Documentos por Colaborador")
 st.write(
-    "Suba os PDFs sem classificação e baixe todos renomeados automaticamente em"
-    " um arquivo ZIP."
-)
-
-# Área de upload (aceita múltiplos arquivos)
-uploaded_files = st.file_uploader(
-    "Selecione os PDFs", type="pdf", accept_multiple_files=True
+    "Envie o PDF consolidado. O sistema lerá cada página via OCR, identificará"
+    " a troca de nomes e gerará um arquivo PDF individual para cada pessoa,"
+    " nomeado apenas com o nome extraído."
 )
 
 
-def sanitize_filename(name: str) -> str:
-  """Remove caracteres inválidos para nomes de arquivos no sistema operacional."""
-  return re.sub(r'[\\/*?:"<>|]', "", name)
+def extrair_texto_com_ocr(page_plumber):
+  """Extrai texto nativo da página ou força OCR via Tesseract se for imagem/escaneado."""
+  texto = page_plumber.extract_text() or ""
+  texto_limpo = texto.strip().replace("\n", "").replace(" ", "")
+
+  # Se houver pouco ou nenhum texto extraível, aciona o OCR
+  if len(texto.strip()) < 30 or len(texto_limpo) < 10:
+    try:
+      img = page_plumber.to_image(resolution=300).original
+      try:
+        texto_ocr = pytesseract.image_to_string(img, lang="por")
+      except Exception:
+        texto_ocr = pytesseract.image_to_string(img, lang="eng")
+
+      if len(texto_ocr.strip()) > len(texto.strip()):
+        texto = texto_ocr
+    except Exception:
+      pass
+  return texto
 
 
-if uploaded_files:
-  if st.button("Processar e Renomear", type="primary"):
+def extrair_nome_colaborador(texto_pagina):
+  """Identifica o nome da pessoa através de padrões genéricos de expressões regulares."""
+  if not texto_pagina:
+    return None
+
+  padroes = [
+      r"(?:NOME|PACIENTE|AVALIADO|COLABORADOR|CANDIDATO|EMPREGADO|TRABALHADOR|NOME\s+DO\s+TRABALHADOR|SR\(A\)|FUNCIONÁRIO)\s*[:\.]*\s*([A-ZÁÉÍÓÚÃÕÇÂÊÎÔÛa-záéíóúãõçâêîôû\s]{3,60})(?=\n|CPF|RG|DATA|SEXO|CARGO|EMPRESA|IDADE|SETOR|\.|$)",
+      r"NOME\.{2,}\s*:\s*\d*[-–]?\s*([A-ZÁÉÍÓÚÃÕÇÂÊÎÔÛa-záéíóúãõçâêîôû\s]{3,60})(?=\n|CPF|DATA|SEXO|\.|$)",
+      r"FUNCIONÁRIO\s*\(CÓDIGO\s*/\s*NOME\)\s*\n?\s*\d+\s*/\s*([A-ZÁÉÍÓÚÃÕÇÂÊÎÔÛa-záéíóúãõçâêîôû\s]{3,60})(?=\n|EMPRESA|RG|CPF|\.|$)",
+      r"FUNCIONÁRIO:\s*\d+\s*-\s*([A-ZÁÉÍÓÚÃÕÇÂÊÎÔÛa-záéíóúãõçâêîôû\s]{3,60})(?=\n|UNIDADE|CNPJ|RG|CPF|\.|$)",
+  ]
+
+  palavras_proibidas = [
+      "APRESENTOU",
+      "DESEMPENHO",
+      "RESULTADO",
+      "EXAME",
+      "DENTRO",
+      "SOLICITANTE",
+      "RELATOR",
+      "LAUDO",
+      "DECLARA",
+      "AVALIADO",
+      "CONCLUSAO",
+      "CONCLUSÃO",
+      "PROTOCOLO",
+  ]
+
+  for padrao in padroes:
+    match = re.search(padrao, texto_pagina, re.IGNORECASE | re.MULTILINE)
+    if match:
+      nome = match.group(1).split("\n")[0].strip()
+      stops = [
+          "SEXO",
+          "CARGO",
+          "CPF",
+          "RG",
+          "DATA",
+          "IDADE",
+          "PIS",
+          "CTPS",
+          "CADASTRO",
+          "ATEND",
+          "UNIDADE",
+          "SETOR",
+          "EMPRESA",
+          "CNPJ",
+          "MÉDICO",
+          "MEDICO",
+          "PROTOCOLO",
+          "CONVÊNIO",
+          "CONVENIO",
+          "EMISSÃO",
+          "EMISSAO",
+      ]
+      for stop in stops:
+        nome = re.split(rf"\b{stop}\b", nome, flags=re.IGNORECASE)[0]
+
+      nome_limpo = re.sub(r'[\\/*?:"<>|]', "", nome)
+      nome_final = re.sub(r"\s+", " ", nome_limpo).upper().strip()
+      nome_final = re.sub(r"^\d+[\s\-–]+", "", nome_final)
+
+      if len(nome_final) > 3 and not any(
+          p in nome_final for p in palavras_proibidas
+      ):
+        return nome_final
+
+  return None
+
+
+def salvar_documento_no_zip(
+    zip_file, paginas, nome_pessoa, contadores_nomes, relatorio
+):
+  """Escreve as páginas acumuladas em um único PDF renomeado dentro do arquivo ZIP."""
+  if not paginas:
+    return
+
+  writer = PdfWriter()
+  for page in paginas:
+    writer.add_page(page)
+
+  pdf_out = io.BytesIO()
+  writer.write(pdf_out)
+
+  nome_base = nome_pessoa if nome_pessoa else "NOME_NAO_ENCONTRADO"
+
+  if nome_base in contadores_nomes:
+    contadores_nomes[nome_base] += 1
+    nome_arquivo_final = f"{nome_base} ({contadores_nomes[nome_base]}).pdf"
+  else:
+    contadores_nomes[nome_base] = 1
+    nome_arquivo_final = f"{nome_base}.pdf"
+
+  zip_file.writestr(nome_arquivo_final, pdf_out.getvalue())
+  relatorio.append(
+      {"Nome Gerado": nome_arquivo_final, "Qtd Páginas": len(paginas)}
+  )
+
+
+arquivo_enviado = st.file_uploader(
+    "Selecione o arquivo PDF consolidado", type=["pdf"]
+)
+
+if arquivo_enviado is not None:
+  if st.button("Separar e Renomear Páginas", type="primary"):
+    reader_pypdf = PdfReader(arquivo_enviado)
+    total_paginas = len(reader_pypdf.pages)
+
     zip_buffer = io.BytesIO()
-    processed_summary = []
+    relatorio_processamento = []
+    contadores_nomes = {}
 
-    progress_bar = st.progress(0)
-    total_files = len(uploaded_files)
+    barra_progresso = st.progress(0)
+    status_texto = st.empty()
 
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-      for idx, file in enumerate(uploaded_files):
-        try:
-          reader = PyPDF2.PdfReader(file)
+    with pdfplumber.open(arquivo_enviado) as pdf_plumber:
+      with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        paginas_acumuladas = []
+        nome_atual = None
 
-          # Extrai o texto da primeira página (ou de todas caso a primeira venha vazia)
-          text = ""
-          for page in reader.pages:
-            extracted = page.extract_text()
-            if extracted:
-              text += extracted + "\n"
+        for idx in range(total_paginas):
+          page_plumber = pdf_plumber.pages[idx]
+          texto_pagina = extrair_texto_com_ocr(page_plumber)
+          nome_detectado = extrair_nome_colaborador(texto_pagina)
 
-          # Regex otimizada: busca por "Nome:" e para antes de rótulos comuns (CPF, RG, Data, Cargo, etc.) ou quebra de linha
-          match = re.search(
-              r"(?:Nome|NOME):\s*([A-Za-zÀ-ÖØ-öø-ÿ\s]+?)(?=\s*(?:CPF|RG|Data|Cargo|Setor|\n|\r|$))",
-              text,
+          status_texto.text(
+              f"Lendo página {idx + 1} de {total_paginas}... (Detectado:"
+              f" {nome_detectado or 'Continuação/Indefinido'})"
           )
 
-          if match:
-            nome_extraido = match.group(1).strip()
-            # Remove múltiplos espaços internos
-            nome_extraido = " ".join(nome_extraido.split())
-            # Sanitiza caracteres proibidoss
-            nome_extraido = sanitize_filename(nome_extraido)
+          # Se encontrou um novo nome e já existiam páginas acumuladas de outra pessoa
+          if nome_detectado and nome_atual and (nome_detectado != nome_atual):
+            salvar_documento_no_zip(
+                zip_file,
+                paginas_acumuladas,
+                nome_atual,
+                contadores_nomes,
+                relatorio_processamento,
+            )
+            paginas_acumuladas = []
+            nome_atual = nome_detectado
+          elif nome_detectado and not nome_atual:
+            nome_atual = nome_detectado
 
-            if nome_extraido:
-              novo_nome = f"DOCUMENTO_SEM_CLASSIFICACAO - {nome_extraido}.pdf"
-            else:
-              novo_nome = f"NOME_NAO_ENCONTRADO_{file.name}"
-          else:
-            novo_nome = f"NOME_NAO_ENCONTRADO_{file.name}"
+          # Adiciona a página atual ao lote do documento do colaborador
+          paginas_acumuladas.append(reader_pypdf.pages[idx])
 
-          # Prevenção contra nomes duplicados no mesmo arquivo ZIP
-          base_nome, ext = novo_nome.rsplit(".", 1)
-          counter = 1
-          nome_final_zip = novo_nome
-          nomer_ja_usados = [item["Novo Nome"] for item in processed_summary]
+          # Atualiza a barra de progresso visual
+          barra_progresso.progress((idx + 1) / total_paginas)
 
-          while nome_final_zip in nomer_ja_usados:
-            nome_final_zip = f"{base_nome}_({counter}).{ext}"
-            counter += 1
-
-          file.seek(0)
-          zip_file.writestr(nome_final_zip, file.read())
-
-          processed_summary.append(
-              {"Original": file.name, "Novo Nome": nome_final_zip}
+        # Salva o último grupo de páginas pendente ao final do loop
+        if paginas_acumuladas:
+          salvar_documento_no_zip(
+              zip_file,
+              paginas_acumuladas,
+              nome_atual,
+              contadores_nomes,
+              relatorio_processamento,
           )
 
-        except Exception as e:
-          processed_summary.append(
-              {"Original": file.name, "Novo Nome": f"ERRO: {str(e)}"}
-          )
+    status_texto.empty()
+    st.success(
+        f"Processamento concluído! {len(relatorio_processamento)} arquivos"
+        " separados gerados."
+    )
 
-        # Atualiza a barra de progresso
-        progress_bar.progress((idx + 1) / total_files)
+    with st.expander("Mapeamento dos Arquivos Separados"):
+      st.dataframe(relatorio_processamento, use_container_width=True)
 
-    st.success("Arquivos processados com sucesso!")
-
-    # Exibe visualização organizada dos arquivos processados
-    with st.expander("Ver mapeamento dos arquivos renomeados"):
-      st.dataframe(processed_summary, use_container_width=True)
-
-    # Botão para baixar o arquivo ZIP
     st.download_button(
-        label="Baixar PDFs Renomeados (.zip)",
+        label="Baixar PDFs Separados (.zip)",
         data=zip_buffer.getvalue(),
-        file_name="termos_renomeados.zip",
+        file_name="documentos_separados.zip",
         mime="application/zip",
     )
