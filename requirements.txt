@@ -1,2 +1,5 @@
 streamlit
-PyPDF2
+pypdf
+pdfplumber
+pytesseract
+Pillow
