@@ -14,6 +14,12 @@ st.write(
     " nomeado apenas com o nome extraído."
 )
 
+# Inicializa variáveis de estado do Streamlit para evitar perdas no recarregamento
+if "zip_buffer" not in st.session_state:
+  st.session_state.zip_buffer = None
+if "relatorio_processamento" not in st.session_state:
+  st.session_state.relatorio_processamento = []
+
 
 def extrair_texto_com_ocr(page_plumber):
   """Extrai texto nativo da página ou força OCR via Tesseract se for imagem/escaneado."""
@@ -42,10 +48,13 @@ def extrair_nome_colaborador(texto_pagina):
     return None
 
   padroes = [
-      r"(?:NOME|PACIENTE|AVALIADO|COLABORADOR|CANDIDATO|EMPREGADO|TRABALHADOR|NOME\s+DO\s+TRABALHADOR|SR\(A\)|FUNCIONÁRIO)\s*[:\.]*\s*([A-ZÁÉÍÓÚÃÕÇÂÊÎÔÛa-záéíóúãõçâêîôû\s]{3,60})(?=\n|CPF|RG|DATA|SEXO|CARGO|EMPRESA|IDADE|SETOR|\.|$)",
-      r"NOME\.{2,}\s*:\s*\d*[-–]?\s*([A-ZÁÉÍÓÚÃÕÇÂÊÎÔÛa-záéíóúãõçâêîôû\s]{3,60})(?=\n|CPF|DATA|SEXO|\.|$)",
-      r"FUNCIONÁRIO\s*\(CÓDIGO\s*/\s*NOME\)\s*\n?\s*\d+\s*/\s*([A-ZÁÉÍÓÚÃÕÇÂÊÎÔÛa-záéíóúãõçâêîôû\s]{3,60})(?=\n|EMPRESA|RG|CPF|\.|$)",
-      r"FUNCIONÁRIO:\s*\d+\s*-\s*([A-ZÁÉÍÓÚÃÕÇÂÊÎÔÛa-záéíóúãõçâêîôû\s]{3,60})(?=\n|UNIDADE|CNPJ|RG|CPF|\.|$)",
+      # Captura declarações do tipo: "Eu, JOÃO DA SILVA, portador do CPF..."
+      r"(?:EU,?\s+)([A-ZÁÉÍÓÚÃÕÇÂÊÎÔÛa-záéíóúãõçâêîôû\s]{3,60})(?=\s*,?\s*(?:PORTADOR|INSCRITO|CPF|RG|DECLARO|ABAIXO))",
+      # Captura rótulos comuns em formulários e laudos
+      r"(?:NOME|PACIENTE|AVALIADO|COLABORADOR|CANDIDATO|EMPREGADO|TRABALHADOR|FUNCIONÁRIO|NOME\s+DO\s+TRABALHADOR|NOME\s+COMPLETO|SR\(A\))\s*[:\.]*\s*([A-ZÁÉÍÓÚÃÕÇÂÊÎÔÛa-záéíóúãõçâêîôû\s]{3,60})(?=\n|CPF|RG|DATA|SEXO|CARGO|EMPRESA|IDADE|SETOR|PIS|CTPS|\.|$)",
+      # Captura padrões com código/matricula (Ex: "FUNCIONÁRIO: 1234 - JOAO SILVA")
+      r"(?:FUNCIONÁRIO|COLABORADOR)\s*\(?CÓDIGO\s*/?\s*NOME\)?\s*[:\.]*\s*\d*\s*[-–/]?\s*([A-ZÁÉÍÓÚÃÕÇÂÊÎÔÛa-záéíóúãõçâêîôû\s]{3,60})(?=\n|EMPRESA|RG|CPF|UNIDADE|\.|$)",
+      r"(?:FUNCIONÁRIO|COLABORADOR|EMPREGADO)\s*:\s*\d+\s*[-–]\s*([A-ZÁÉÍÓÚÃÕÇÂÊÎÔÛa-záéíóúãõçâêîôû\s]{3,60})(?=\n|UNIDADE|CNPJ|RG|CPF|\.|$)",
   ]
 
   palavras_proibidas = [
@@ -62,35 +71,41 @@ def extrair_nome_colaborador(texto_pagina):
       "CONCLUSAO",
       "CONCLUSÃO",
       "PROTOCOLO",
+      "RESPONSABILIDADE",
+      "TERMO",
+  ]
+
+  stops = [
+      "SEXO",
+      "CARGO",
+      "CPF",
+      "RG",
+      "DATA",
+      "IDADE",
+      "PIS",
+      "CTPS",
+      "CADASTRO",
+      "ATEND",
+      "UNIDADE",
+      "SETOR",
+      "EMPRESA",
+      "CNPJ",
+      "MÉDICO",
+      "MEDICO",
+      "PROTOCOLO",
+      "CONVÊNIO",
+      "CONVENIO",
+      "EMISSÃO",
+      "EMISSAO",
+      "PORTADOR",
+      "INSCRITO",
   ]
 
   for padrao in padroes:
     match = re.search(padrao, texto_pagina, re.IGNORECASE | re.MULTILINE)
     if match:
       nome = match.group(1).split("\n")[0].strip()
-      stops = [
-          "SEXO",
-          "CARGO",
-          "CPF",
-          "RG",
-          "DATA",
-          "IDADE",
-          "PIS",
-          "CTPS",
-          "CADASTRO",
-          "ATEND",
-          "UNIDADE",
-          "SETOR",
-          "EMPRESA",
-          "CNPJ",
-          "MÉDICO",
-          "MEDICO",
-          "PROTOCOLO",
-          "CONVÊNIO",
-          "CONVENIO",
-          "EMISSÃO",
-          "EMISSAO",
-      ]
+
       for stop in stops:
         nome = re.split(rf"\b{stop}\b", nome, flags=re.IGNORECASE)[0]
 
@@ -166,27 +181,37 @@ if arquivo_enviado is not None:
               f" {nome_detectado or 'Continuação/Indefinido'})"
           )
 
-          # Se encontrou um novo nome e já existiam páginas acumuladas de outra pessoa
-          if nome_detectado and nome_atual and (nome_detectado != nome_atual):
-            salvar_documento_no_zip(
-                zip_file,
-                paginas_acumuladas,
-                nome_atual,
-                contadores_nomes,
-                relatorio_processamento,
-            )
-            paginas_acumuladas = []
-            nome_atual = nome_detectado
-          elif nome_detectado and not nome_atual:
-            nome_atual = nome_detectado
+          if nome_detectado:
+            # Caso 1: Trocou o nome do colaborador
+            if nome_atual and (nome_detectado != nome_atual):
+              salvar_documento_no_zip(
+                  zip_file,
+                  paginas_acumuladas,
+                  nome_atual,
+                  contadores_nomes,
+                  relatorio_processamento,
+              )
+              paginas_acumuladas = []
+              nome_atual = nome_detectado
 
-          # Adiciona a página atual ao lote do documento do colaborador
+            # Caso 2: Primeiro nome detectado, mas havia páginas orfãs anteriores
+            elif not nome_atual:
+              if paginas_acumuladas:
+                salvar_documento_no_zip(
+                    zip_file,
+                    paginas_acumuladas,
+                    "NOME_NAO_ENCONTRADO",
+                    contadores_nomes,
+                    relatorio_processamento,
+                )
+                paginas_acumuladas = []
+              nome_atual = nome_detectado
+
+          # Adiciona a página atual ao grupo
           paginas_acumuladas.append(reader_pypdf.pages[idx])
-
-          # Atualiza a barra de progresso visual
           barra_progresso.progress((idx + 1) / total_paginas)
 
-        # Salva o último grupo de páginas pendente ao final do loop
+        # Salva o último grupo pendente
         if paginas_acumuladas:
           salvar_documento_no_zip(
               zip_file,
@@ -196,18 +221,27 @@ if arquivo_enviado is not None:
               relatorio_processamento,
           )
 
+    # Armazena os resultados na sessão
+    st.session_state.zip_buffer = zip_buffer.getvalue()
+    st.session_state.relatorio_processamento = relatorio_processamento
     status_texto.empty()
-    st.success(
-        f"Processamento concluído! {len(relatorio_processamento)} arquivos"
-        " separados gerados."
+
+# Exibição dos resultados persistidos (fora do escopo do botão para evitar desaparecer ao recarregar)
+if st.session_state.zip_buffer is not None:
+  st.success(
+      f"Processamento concluído!"
+      f" {len(st.session_state.relatorio_processamento)} arquivos separados"
+      " gerados."
+  )
+
+  with st.expander("Mapeamento dos Arquivos Separados", expanded=True):
+    st.dataframe(
+        st.session_state.relatorio_processamento, use_container_width=True
     )
 
-    with st.expander("Mapeamento dos Arquivos Separados"):
-      st.dataframe(relatorio_processamento, use_container_width=True)
-
-    st.download_button(
-        label="Baixar PDFs Separados (.zip)",
-        data=zip_buffer.getvalue(),
-        file_name="documentos_separados.zip",
-        mime="application/zip",
-    )
+  st.download_button(
+      label="Baixar PDFs Separados (.zip)",
+      data=st.session_state.zip_buffer,
+      file_name="documentos_separados.zip",
+      mime="application/zip",
+  )
