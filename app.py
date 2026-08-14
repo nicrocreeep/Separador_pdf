@@ -40,41 +40,93 @@ def extrair_texto(page_plumber):
     return texto
 
 
+def normalizar_texto(texto):
+    """Normaliza espaços e quebras de linha em um único espaço."""
+    return re.sub(r"\s+", " ", texto)
+
+
 def extrair_nome(texto):
-    """Extrai o nome baseado no padrão exato do Termo de Ciência."""
+    """
+    Extrai o nome do colaborador usando múltiplos padrões.
+    Adicione novos padrões no final da lista se surgir um documento novo.
+    """
     if not texto:
         return None
 
-    # Normaliza espaços e quebras de linha em um único espaço
-    texto = re.sub(r"\s+", " ", texto)
+    texto = normalizar_texto(texto)
 
-    # PADRÃO 1 (principal): "Eu, NOME COMPLETO colaborador da empresa"
-    # O nome está sempre em maiúsculas antes da palavra "colaborador"
-    padrao = r"Eu,\s+([A-Z][A-Z\s]+?)\s+colaborador\b"
-    match = re.search(padrao, texto, re.IGNORECASE)
-    if match:
-        nome = match.group(1).strip()
-        if 3 < len(nome) < 60:
-            return nome
+    # ============================================================
+    # LISTA DE PADRÕES — ordem: do mais específico ao mais genérico
+    # ============================================================
+    padroes = [
+        # 1. FICHA REGISTRO: "NOME FUNCIONÁRIO  ALLISON CECILIO DE MATOS"
+        (r"NOME\s*FUNCION[ÁA]RIO\s+([A-Z][A-Z\s]+?)(?:\s+MATR[ÍI]CULA|\s+REGISTRO|$)", re.IGNORECASE),
 
-    # PADRÃO 2 (fallback): campo "Nome:" no rodapé do documento
-    padrao2 = r"Nome:\s*([A-Z][A-Z\s]+?)(?:\s+RG:|\s+MAT:|$)"
-    match = re.search(padrao2, texto)
-    if match:
-        nome = match.group(1).strip()
-        if 3 < len(nome) < 60:
-            return nome
+        # 2. ASO: "2 - Nome: ALISSON CECILIO DE MATOS"  (ou "Nome:" em geral)
+        (r"Nome\s*:\s*([A-Z][A-Z\s]+?)(?:\s+CPF|\s+Cargo|\s+Fun[çc][ãa]o|\s+Admiss[ãa]o|\s+Idade|$)", re.IGNORECASE),
 
-    # PADRÃO 3 (último recurso): qualquer coisa após "Eu," em maiúsculas
-    padrao3 = r"Eu,\s+([A-Z][A-Z\s]+)"
-    match = re.search(padrao3, texto)
-    if match:
-        nome = match.group(1).strip()
-        # Corta se encontrar palavras que não fazem parte do nome
-        for stop in ["COLABORADOR", "DECLARO", "TERMO", "EMPRESA", "INSTRUÇÕES"]:
-            nome = nome.split(stop)[0].strip()
-        if 3 < len(nome) < 60:
-            return nome
+        # 3. FICHA EPI: "COLABORADOR: ALLISON CECILIO DE MATOS"
+        (r"COLABORADOR[:\s]+([A-Z][A-Z\s]+?)(?:\s+CHAPA|\s+Fun[çc][ãa]o|$)", re.IGNORECASE),
+
+        # 4. CONTRATO: "NOME: ALLISON CECILIO DE MATOS FUNÇÃO: ..."
+        (r"NOME[:\s]+([A-Z][A-Z\s]+?)(?:\s+FUN[ÇC][ÃA]O|\s+CTPS|\s+Endere[çc]o|$)", re.IGNORECASE),
+
+        # 5. TERMO PARTICIPAÇÃO PROCESSO SELETIVO: "CANDIDATO: ALLISON CECILIO DE MATOS CPF:"
+        (r"CANDIDATO[:\s]+([A-Z][A-Z\s]+?)(?:\s+CPF|$)", re.IGNORECASE),
+
+        # 6. DECLARAÇÃO CONTATO ELETRÔNICO: "Funcionário: ALLISON CECILIO DE MATOS"
+        (r"Funcion[áa]rio[:\s]+([A-Z][A-Z\s]+?)(?:\s+CPF|$)", re.IGNORECASE),
+
+        # 7. DECLARAÇÃO ESCOLARIDADE: "Declaro ... que eu, ALLISON CECILIO DE MATOS, portador..."
+        (r"Declaro.*?eu,\s*([A-Z][A-Z\s]+?)(?:,\s*portador|\s+CTPS|$)", re.IGNORECASE),
+
+        # 8. AUTORIZAÇÕES / TERMOS DocuSign (padrão principal): "Eu, ALLISON CECILIO DE MATOS, CPF..."
+        (r"Eu,\s*([A-Z][A-Z\s]+?)(?:,\s*CPF|\s+declaro|\s+portador|\s+autorizo|\s+colaborador|$)", re.IGNORECASE),
+
+        # 9. AUTORIZAÇÃO USO IMAGEM: "Eu, ALLISON CECILIO DE MATOS, portador da Cédula..."
+        (r"Eu,\s*([A-Z][A-Z\s]+?)(?:,\s*portador|$)", re.IGNORECASE),
+
+        # 10. ORDEM DE SERVIÇO: "1.1 Nome : ALLISON CECILIO DE MATOS 1.2 CPF..."
+        (r"1\.1\s*Nome\s*:\s*([A-Z][A-Z\s]+?)(?:\s+1\.2|\s+CPF|$)", re.IGNORECASE),
+
+        # 11. ACORDO COMPENSAÇÃO: "Nome Completo: ALLISON CECILIO DE MATOS Portador..."
+        (r"Nome\s*Completo[:\s]+([A-Z][A-Z\s]+?)(?:\s+Portador|\s+CPF|$)", re.IGNORECASE),
+
+        # 12. RECEBIMENTO CARTÃO TICKET: "NOME ALLISON CECILIO DE MATOS" (tabela)
+        (r"\|NOME\|\s*([A-Z][A-Z\s]+?)(?:\||$)", re.IGNORECASE),
+
+        # 13. REG. INTEGRAÇÃO: "Nome: ALLISON CECILIO DE MATOS" (com quebra de linha possível)
+        (r"Nome[:\s]+([A-Z][A-Z\s]+?)(?:\s+Fun[çc][ãa]o|\s+Encanador|$)", re.IGNORECASE),
+
+        # 14. TERMO CIÊNCIA PRAZO ATESTADO: "Eu, ALLISON CECILIO DE MATOS, CPF..."
+        # Já coberto pelo padrão 8, mas deixo explícito para facilitar manutenção futura
+        (r"Eu,\s*([A-Z][A-Z\s]+?)(?:,\s*CPF|\s+colaborador|$)", re.IGNORECASE),
+
+        # 15. TERMO SIGILO: "Eu, ALLISON CECILIO DE MATOS. Portador..."
+        (r"Eu,\s*([A-Z][A-Z\s]+?)\.\s*Portador", re.IGNORECASE),
+
+        # 16. TERMO RECEBIMENTO CÓDIGO CONDUTA: "Eu , ALLISON CECILIO DE MATOS , portador..."
+        (r"Eu\s*,\s*([A-Z][A-Z\s]+?)\s*,\s*portador", re.IGNORECASE),
+
+        # 17. FALLBACK genérico "Eu, NOME" (se nada acima pegar)
+        (r"Eu,\s*([A-Z][A-Z\s]+?)(?:\s+COLABORADOR|\s+DECLARO|\s+TERMO|\s+EMPRESA|$)", re.IGNORECASE),
+    ]
+
+    for padrao, flags in padroes:
+        match = re.search(padrao, texto, flags)
+        if match:
+            nome = match.group(1).strip()
+
+            # Corte de segurança: remove palavras que não fazem parte do nome
+            stop_words = ["COLABORADOR", "DECLARO", "TERMO", "EMPRESA",
+                          "INSTRUÇÕES", "CPF", "RG", "MATRICULA", "FUNÇÃO",
+                          "CARGO", "PORTADOR", "AUTORIZO"]
+            for stop in stop_words:
+                nome = nome.split(stop)[0].strip()
+
+            # Validação: entre 5 e 60 chars, pelo menos 2 palavras
+            if 5 < len(nome) < 60 and len(nome.split()) >= 2:
+                return nome
 
     return None
 
