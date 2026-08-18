@@ -165,7 +165,308 @@ def extrair_nome(texto):
             return nome
 
     return None
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNÇÕES PARA AGRUPAMENTO DE DOCUMENTOS MULTIPÁGINAS
+# ─────────────────────────────────────────────────────────────────────────────
 
+def extrair_produto(texto):
+    """
+    Tenta identificar o nome do produto/documento em FDS/FISPQ.
+    Exemplos:
+    Produto: Tinta Spray Uso Geral - Mundial Prime
+    Nome do produto: ÁGUA DESMINERALIZADA
+    """
+    if not texto:
+        return None
+
+    texto_normalizado = normalizar_texto(texto)
+
+    padroes = [
+        r"\bProduto\s*:\s*(.{3,120}?)(?=\s+(?:Versão|Versao|Data|Elaborada|Revisão|Revisao|Página|Pagina|FDS|1[\.\-]))",
+        r"\bNome do produto\s*:\s*(.{3,120}?)(?=\s+(?:Nome da Empresa|Nome da empresa|Uso do produto|Usos recomendados|2[\.\-]|$))",
+    ]
+
+    for padrao in padroes:
+        match = re.search(
+            padrao,
+            texto_normalizado,
+            re.IGNORECASE
+        )
+
+        if match:
+            produto = match.group(1).strip(" .:-")
+
+            if 3 <= len(produto) <= 120:
+                return produto
+
+    return None
+
+
+def extrair_paginas_documento(texto):
+    """
+    Detecta padrões como:
+    Página 1 de 13
+    Página 1/13
+    Página 01 de 06
+    """
+
+    if not texto:
+        return None, None
+
+    texto_normalizado = normalizar_texto(texto)
+
+    padroes = [
+        r"\bP[ÁA]GINA\s+(\d{1,2})\s*(?:DE|/)\s*(\d{1,2})\b",
+        r"\bP[ÁA]GINA(\d{1,2})DE(\d{1,2})\b",
+    ]
+
+    for padrao in padroes:
+        match = re.search(
+            padrao,
+            texto_normalizado,
+            re.IGNORECASE
+        )
+
+        if match:
+            pagina_atual = int(match.group(1))
+            total_paginas = int(match.group(2))
+
+            if 1 <= pagina_atual <= total_paginas <= 99:
+                return pagina_atual, total_paginas
+
+    return None, None
+
+
+def normalizar_produto(produto):
+    """
+    Normaliza o nome do produto para facilitar comparação.
+    """
+
+    if not produto:
+        return ""
+
+    texto = produto.upper()
+
+    texto = re.sub(
+        r"[^A-Z0-9À-ÿ\s]",
+        " ",
+        texto
+    )
+
+    texto = re.sub(
+        r"\s+",
+        " ",
+        texto
+    )
+
+    return texto.strip()
+
+
+def produtos_parecidos(produto1, produto2):
+    """
+    Compara dois produtos.
+    Usa principalmente palavras em comum, que funciona melhor
+    quando o OCR altera alguns caracteres.
+    """
+
+    if not produto1 or not produto2:
+        return False
+
+    p1 = normalizar_produto(produto1)
+    p2 = normalizar_produto(produto2)
+
+    if p1 == p2:
+        return True
+
+    palavras1 = set(
+        palavra
+        for palavra in p1.split()
+        if len(palavra) >= 3
+    )
+
+    palavras2 = set(
+        palavra
+        for palavra in p2.split()
+        if len(palavra) >= 3
+    )
+
+    if not palavras1 or not palavras2:
+        return False
+
+    intersecao = len(
+        palavras1.intersection(palavras2)
+    )
+
+    menor = min(
+        len(palavras1),
+        len(palavras2)
+    )
+
+    return (
+        intersecao / menor >= 0.60
+    )
+
+
+def criar_grupos_documentos(paginas_info):
+    """
+    Agrupa páginas consecutivas que pertencem ao mesmo documento.
+
+    Retorna uma lista no formato:
+
+    [
+        {
+            "produto": "...",
+            "paginas": [1, 2, 3, 4]
+        },
+        ...
+    ]
+    """
+
+    grupos = []
+
+    grupo_atual = None
+
+    for info in paginas_info:
+
+        numero_pagina = info["pagina"]
+        produto = info["produto"]
+        pagina_doc = info["pagina_doc"]
+        total_doc = info["total_doc"]
+
+        # ---------------------------------------------------------------
+        # Primeira página do processamento
+        # ---------------------------------------------------------------
+
+        if grupo_atual is None:
+
+            grupo_atual = {
+                "produto": produto,
+                "paginas": [numero_pagina],
+                "total_esperado": total_doc,
+                "ultima_pagina_documento": pagina_doc,
+            }
+
+            grupos.append(grupo_atual)
+            continue
+
+        continuar = False
+
+        # ---------------------------------------------------------------
+        # Caso o documento informe explicitamente Página X/Y
+        # ---------------------------------------------------------------
+
+        if pagina_doc is not None:
+
+            ultima = grupo_atual[
+                "ultima_pagina_documento"
+            ]
+
+            esperado = (
+                grupo_atual[
+                    "total_esperado"
+                ]
+            )
+
+            # Exemplo:
+            # página anterior = 3/13
+            # atual = 4/13
+            if (
+                ultima is not None
+                and pagina_doc == ultima + 1
+            ):
+                continuar = True
+
+            # Se mudou para Página 1, é praticamente certeza
+            # que começou um documento novo.
+            if pagina_doc == 1:
+                continuar = False
+
+            # Se o documento atual já chegou ao total informado,
+            # não pode continuar.
+            if (
+                esperado is not None
+                and ultima == esperado
+            ):
+                continuar = False
+
+        # ---------------------------------------------------------------
+        # Caso não exista marcador de página
+        # ---------------------------------------------------------------
+
+        else:
+
+            if (
+                grupo_atual["produto"]
+                and produto
+                and produtos_parecidos(
+                    grupo_atual["produto"],
+                    produto
+                )
+            ):
+                continuar = True
+
+        # ---------------------------------------------------------------
+        # Confirma pelo produto
+        # ---------------------------------------------------------------
+
+        if produto and grupo_atual["produto"]:
+
+            if produtos_parecidos(
+                grupo_atual["produto"],
+                produto
+            ):
+                continuar = True
+
+            elif pagina_doc is None:
+                continuar = False
+
+        # ---------------------------------------------------------------
+        # Se não conseguiu identificar nada na página,
+        # mantém no grupo anterior.
+        # Isso é importante para OCR ruim.
+        # ---------------------------------------------------------------
+
+        if (
+            not produto
+            and pagina_doc is None
+        ):
+            continuar = True
+
+        # ---------------------------------------------------------------
+        # Adiciona ao grupo ou cria outro
+        # ---------------------------------------------------------------
+
+        if continuar:
+
+            grupo_atual["paginas"].append(
+                numero_pagina
+            )
+
+            if produto and not grupo_atual["produto"]:
+                grupo_atual["produto"] = produto
+
+            if pagina_doc is not None:
+                grupo_atual[
+                    "ultima_pagina_documento"
+                ] = pagina_doc
+
+            if total_doc is not None:
+                grupo_atual[
+                    "total_esperado"
+                ] = total_doc
+
+        else:
+
+            grupo_atual = {
+                "produto": produto,
+                "paginas": [numero_pagina],
+                "total_esperado": total_doc,
+                "ultima_pagina_documento": pagina_doc,
+            }
+
+            grupos.append(grupo_atual)
+
+    return grupos
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INTERFACE STREAMLIT
@@ -174,7 +475,23 @@ def extrair_nome(texto):
 arquivo = st.file_uploader("Selecione o PDF consolidado", type=["pdf"])
 
 if arquivo is not None:
-    if st.button("Separar e Renomear Páginas", type="primary"):
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        separar_paginas = st.button(
+            "📄 Separar página por página",
+            type="primary",
+            use_container_width=True
+        )
+
+    with col2:
+        juntar_documentos = st.button(
+            "📚 Juntar documentos parecidos",
+            use_container_width=True
+        )
+
+    if separar_paginas:
         reader = PdfReader(arquivo)
         total = len(reader.pages)
 
@@ -233,6 +550,224 @@ if arquivo is not None:
         st.session_state.zip_buffer = zip_buffer.getvalue()
         st.session_state.relatorio = relatorio
         status.empty()
+            # ─────────────────────────────────────────────────────────────────────────
+    # MODO: JUNTAR DOCUMENTOS MULTIPÁGINAS
+    # ─────────────────────────────────────────────────────────────────────────
+
+    if juntar_documentos:
+
+        reader = PdfReader(arquivo)
+        total = len(reader.pages)
+
+        barra = st.progress(0)
+        status = st.empty()
+
+        paginas_info = []
+
+        # ==============================================================
+        # ANALISA TODAS AS PÁGINAS
+        # ==============================================================
+
+        with pdfplumber.open(arquivo) as pdf_plumber:
+
+            for idx in range(total):
+
+                page = pdf_plumber.pages[idx]
+
+                texto = extrair_texto(page)
+
+                produto = extrair_produto(texto)
+
+                pagina_doc, total_doc = (
+                    extrair_paginas_documento(texto)
+                )
+
+                paginas_info.append({
+                    "pagina": idx + 1,
+                    "produto": produto,
+                    "pagina_doc": pagina_doc,
+                    "total_doc": total_doc,
+                })
+
+                if pagina_doc and total_doc:
+
+                    status.text(
+                        f"Analisando página {idx + 1}/{total} — "
+                        f"{produto or 'PRODUTO NÃO ENCONTRADO'} — "
+                        f"FDS {pagina_doc}/{total_doc}"
+                    )
+
+                else:
+
+                    status.text(
+                        f"Analisando página {idx + 1}/{total} — "
+                        f"{produto or 'PRODUTO NÃO ENCONTRADO'}"
+                    )
+
+                barra.progress(
+                    (idx + 1) / total
+                )
+
+        # ==============================================================
+        # AGRUPA AS PÁGINAS
+        # ==============================================================
+
+        status.text(
+            "🧠 Agrupando documentos..."
+        )
+
+        grupos = criar_grupos_documentos(
+            paginas_info
+        )
+
+        # ==============================================================
+        # CRIA O ZIP
+        # ==============================================================
+
+        zip_buffer = io.BytesIO()
+        relatorio = []
+        contadores = {}
+
+        with zipfile.ZipFile(
+            zip_buffer,
+            "w",
+            zipfile.ZIP_DEFLATED
+        ) as zf:
+
+            for numero, grupo in enumerate(
+                grupos,
+                start=1
+            ):
+
+                produto = grupo["produto"]
+
+                if produto:
+
+                    nome_base = produto
+
+                else:
+
+                    nome_base = (
+                        f"DOCUMENTO_{numero}"
+                    )
+
+                # Remove caracteres inválidos
+                nome_base = re.sub(
+                    r'[\\/*?:"<>|]',
+                    "",
+                    nome_base
+                ).strip()
+
+                if not nome_base:
+                    nome_base = (
+                        f"DOCUMENTO_{numero}"
+                    )
+
+                # ======================================================
+                # EVITA NOMES DUPLICADOS
+                # ======================================================
+
+                if nome_base in contadores:
+
+                    contadores[nome_base] += 1
+
+                    nome_arquivo = (
+                        f"{nome_base} "
+                        f"({contadores[nome_base]}).pdf"
+                    )
+
+                else:
+
+                    contadores[nome_base] = 1
+
+                    nome_arquivo = (
+                        f"{nome_base}.pdf"
+                    )
+
+                # ======================================================
+                # JUNTA AS PÁGINAS
+                # ======================================================
+
+                writer = PdfWriter()
+
+                for pagina in grupo["paginas"]:
+
+                    writer.add_page(
+                        reader.pages[pagina - 1]
+                    )
+
+                pdf_out = io.BytesIO()
+
+                writer.write(pdf_out)
+
+                zf.writestr(
+                    nome_arquivo,
+                    pdf_out.getvalue()
+                )
+
+                # ======================================================
+                # RELATÓRIO
+                # ======================================================
+
+                relatorio.append({
+                    "Arquivo": nome_arquivo,
+                    "Produto": produto or "—",
+                    "Página inicial": grupo["paginas"][0],
+                    "Página final": grupo["paginas"][-1],
+                    "Quantidade de páginas": len(
+                        grupo["paginas"]
+                    ),
+                    "Total indicado na FDS": (
+                        grupo["total_esperado"]
+                        or "—"
+                    ),
+                })
+
+        # ==============================================================
+        # SALVA RESULTADO
+        # ==============================================================
+
+        st.session_state.zip_buffer = (
+            zip_buffer.getvalue()
+        )
+
+        st.session_state.relatorio = relatorio
+
+        barra.empty()
+        status.empty()
+
+        st.success(
+            f"✅ {len(grupos)} documentos agrupados "
+            f"a partir de {total} páginas!"
+        )
+
+        # ==============================================================
+        # MOSTRA COMO O SISTEMA AGRUPOU
+        # ==============================================================
+
+        with st.expander(
+            "🔎 Ver agrupamento detectado",
+            expanded=True
+        ):
+
+            for numero, grupo in enumerate(
+                grupos,
+                start=1
+            ):
+
+                produto = (
+                    grupo["produto"]
+                    or "PRODUTO NÃO IDENTIFICADO"
+                )
+
+                paginas = grupo["paginas"]
+
+                st.write(
+                    f"**Documento {numero}:** "
+                    f"{produto} — "
+                    f"páginas {paginas[0]} até {paginas[-1]} "
+                    f"({len(paginas)} páginas)"
+                )
 
 # Exibe resultados (persiste após recarregar)
 if st.session_state.zip_buffer is not None:
